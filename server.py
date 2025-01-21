@@ -3,23 +3,31 @@ import threading
 import json
 from sentence_transformers import SentenceTransformer
 from collections import deque
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Literal
 import torch
 import time
-
-
-class Document:
-    def __init__(self, size: int, data: str = ""):
-        self.size = size
-        self.data = data
-        self.pending = size
+import struct
 
 
 class Response:
-    def __init__(self, id: str, vector: torch.Tensor, is_query: bool):
+    def __init__(self, id: int, vector: torch.Tensor, is_query: bool):
         self.id = id
         self.is_query = is_query
         self.vector = vector
+
+
+class Message:
+    def __init__(self, kind: Literal["DATA", "COMMAND", "QUERY"], **kwargs):
+        self.kind = kind
+        if kind == "DATA":
+            self.id = kwargs["id"]
+            self.data = kwargs["data"]
+        elif kind == "COMMAND":
+            self.command = kwargs["command"]
+        elif kind == "QUERY":
+            self.data = kwargs["data"]
+        else:
+            raise ValueError("Invalid message type", kind, kwargs)
 
 
 running: threading.Event = threading.Event()
@@ -29,9 +37,6 @@ modelLock: threading.Lock = threading.Lock()
 model = []
 embeddingQ: deque["Response"] = deque()
 embeddingQLock: threading.Lock = threading.Lock()
-delim = ";;"
-ending = "$$"
-idMap: Dict[str, "Document"] = {}
 
 
 def model_loader(modelArr: List, modelLock: threading.Lock) -> None:
@@ -42,31 +47,29 @@ def model_loader(modelArr: List, modelLock: threading.Lock) -> None:
     print(f"Model loading took: {time.time() - start}s")
 
 
-def parse_command(command):
-    if command == "Quit":
+def run_command(command: str) -> None:
+    if command == "close":
         running.clear()
         print("Server: Quitting")
-    if command == "Heartbeat":
-        print(f"Server: {time.time():.4f} Heartbeat")
+        return
+    if command == "heartbeat":
+        # print(f"Server: {time.time():.4f} Heartbeat")
+        return
 
 
-def process_data(id: str, data: str, is_query: bool = False) -> None:
-    print(f"Processing data with id {id}")
-    if id not in idMap:
-        print(f"Adding data with id {id}")
-        idMap[id] = Document(int(data))
-    else:
-        idMap[id].data += data
-        idMap[id].pending -= len(data)
-        print(idMap[id].pending)
-        print(idMap[id].size)
-        print(idMap[id].data)
-        if idMap[id].pending == 0:
-            modelLock.acquire()
-            embedding = model[0].encode([idMap[id].data])
-            modelLock.release()
-            embeddingQ.append(Response(id, embedding, is_query))
-            del idMap[id]
+def process_message(message: Message) -> None:
+    if message.kind == "COMMAND":
+        run_command(message.command)
+        return
+    modelLock.acquire()
+    embedding = model[0].encode([message.data])
+    modelLock.release()
+    if message.kind == "QUERY":
+        embeddingQ.append(Response(0, embedding, True))
+        return
+    if message.kind == "DATA":
+        embeddingQ.append(Response(message.id, embedding, False))
+        return
 
 
 def embedding_response(
@@ -87,7 +90,9 @@ def embedding_response(
                     "vector": embedding.vector.tolist()[0],
                 }
             )
-            client_socket.send(response.encode("utf-8"))
+            length = len(response)
+            client_socket.sendall(struct.pack(">I", length))
+            client_socket.sendall(response.encode("utf-8"))
         else:
             time.sleep(1)
     print("Closing response thread")
@@ -98,25 +103,20 @@ def handle_client_connection(client_socket: socket.socket) -> None:
     # NOTE: Use a heartbeat mechanism from client to keep the connection alive, or the current socket will die after 5 seconds of inactivity
     while running.is_set():
         try:
-            request = client_socket.recv(4096).decode("utf-8")
-            if not len(request):
+            header = client_socket.recv(4)
+            if not header:
                 continue
-            request_content = request.split(ending)[0]
-            print(request_content)
+            length = struct.unpack(">I", header)[0]
+
+            request = client_socket.recv(length).decode("utf-8")
+            print(request)
+            request_content = json.loads(request)
             try:
-                reqType, id, payload = request_content.split(delim)
+                message: Message = Message(**request_content)
+                process_message(message)
             except Exception as e:
                 print(f"ValueError: {e}")
                 running.clear()
-            if reqType == "Q":
-                process_data(id, payload, True)
-                continue
-            if reqType == "C":
-                parse_command(payload)
-                continue
-            if reqType == "D":
-                process_data(id, payload)
-                continue
         except Exception as e:
             running.clear()
             print(f"Error: {e}")
